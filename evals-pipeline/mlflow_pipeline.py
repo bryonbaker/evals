@@ -135,6 +135,7 @@ def run_all_mlflow_tests(
         import httpx
         full_response = ""
         trace_id = None
+        tool_calls = []
         with httpx.Client(timeout=None) as http_client:
             with http_client.stream("POST", url, json=payload) as response:
                 if response.status_code != 200:
@@ -147,9 +148,11 @@ def run_all_mlflow_tests(
                             full_response += data.get("delta", "")
                             if data.get("type") == "trace_id":
                                 trace_id = data.get("trace_id")
+                            elif data.get("type") == "tool_call":
+                                tool_calls.append(data.get("name"))
                         except json.JSONDecodeError:
                             continue
-        return full_response, trace_id
+        return full_response, trace_id, tool_calls
 
     def call_backend(inputs, endpoint):
         url = urljoin(backend_url, endpoint)
@@ -157,7 +160,7 @@ def run_all_mlflow_tests(
             return send_request({"prompt": inputs["prompt"]}, url)
         elif "messages" in inputs:
             return send_request(inputs, url)
-        return "", None
+        return "", None, []
 
     def fetch_workspace_records(workspace, dataset_names):
         """Fetch records from named datasets in a given MLflow workspace."""
@@ -227,6 +230,13 @@ def run_all_mlflow_tests(
                 "Respond with only \"yes\" or \"no\"."
             )
 
+        @scorer
+        def tool_choice(inputs: dict, expectations: dict) -> bool:
+            """Did the agent call all expected tools?"""
+            actual = set(inputs.get("tool_calls", []))
+            expected = set(expectations.get("expected_tools", []))
+            return expected.issubset(actual)
+
         summary_quality_judge = make_judge(
             name="summary_quality",
             instructions=judge_instructions,
@@ -279,6 +289,7 @@ def run_all_mlflow_tests(
             "summary_quality": summary_quality_judge,
             "answer_quality": answer_quality_judge,
             "is_shorter": is_shorter,
+            "tool_choice": tool_choice,
             "retrieval_relevance": retrieval_relevance_scorer,
             "retrieval_groundedness": retrieval_groundedness_scorer,
         }
@@ -299,8 +310,11 @@ def run_all_mlflow_tests(
             if not inputs.get("prompt") and not inputs.get("messages"):
                 continue
             print(f"Calling {endpoint} with test inputs...")
-            generated, trace_id = call_backend(inputs, endpoint)
-            entry = {"inputs": inputs, "outputs": generated, "expectations": expectations}
+            generated, trace_id, tool_calls = call_backend(inputs, endpoint)
+            entry_inputs = dict(inputs)
+            if tool_calls:
+                entry_inputs["tool_calls"] = tool_calls
+            entry = {"inputs": entry_inputs, "outputs": generated, "expectations": expectations}
             if trace_id:
                 entry["trace_id"] = trace_id
             eval_data.append(entry)
@@ -312,8 +326,11 @@ def run_all_mlflow_tests(
             if not inputs.get("prompt") and not inputs.get("messages"):
                 continue
             print(f"Calling {endpoint} with external record inputs...")
-            generated, trace_id = call_backend(inputs, endpoint)
-            entry = {"inputs": inputs, "outputs": generated, "expectations": expectations}
+            generated, trace_id, tool_calls = call_backend(inputs, endpoint)
+            entry_inputs = dict(inputs)
+            if tool_calls:
+                entry_inputs["tool_calls"] = tool_calls
+            entry = {"inputs": entry_inputs, "outputs": generated, "expectations": expectations}
             if trace_id:
                 entry["trace_id"] = trace_id
             eval_data.append(entry)
