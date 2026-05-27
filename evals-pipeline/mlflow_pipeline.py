@@ -134,6 +134,7 @@ def run_all_mlflow_tests(
     def send_request(payload, url):
         import httpx
         full_response = ""
+        trace_id = None
         with httpx.Client(timeout=None) as http_client:
             with http_client.stream("POST", url, json=payload) as response:
                 if response.status_code != 200:
@@ -144,9 +145,11 @@ def run_all_mlflow_tests(
                         try:
                             data = json.loads(line[len("data: "):])
                             full_response += data.get("delta", "")
+                            if data.get("type") == "trace_id":
+                                trace_id = data.get("trace_id")
                         except json.JSONDecodeError:
                             continue
-        return full_response
+        return full_response, trace_id
 
     def call_backend(inputs, endpoint):
         url = urljoin(backend_url, endpoint)
@@ -154,7 +157,7 @@ def run_all_mlflow_tests(
             return send_request({"prompt": inputs["prompt"]}, url)
         elif "messages" in inputs:
             return send_request(inputs, url)
-        return ""
+        return "", None
 
     def fetch_workspace_records(workspace, dataset_names):
         """Fetch records from named datasets in a given MLflow workspace."""
@@ -242,15 +245,49 @@ def run_all_mlflow_tests(
             extra_headers={"Authorization": "Bearer no-key-required"},
         )
 
+        retrieval_relevance_scorer = make_judge(
+            name="retrieval_relevance",
+            instructions=(
+                "You are evaluating whether retrieved document context is relevant to a user query.\n\n"
+                "INPUTS (user query and retrieved context):\n{{ inputs }}\n\n"
+                "Is the retrieved context relevant to answering the user query? "
+                "Answer only 'yes' or 'no'."
+            ),
+            feedback_value_type=Literal["yes", "no"],
+            model="openai:/llama32",
+            base_url=llm_endpoint + "/v1/chat/completions",
+            extra_headers={"Authorization": "Bearer no-key-required"},
+        )
+
+        retrieval_groundedness_scorer = make_judge(
+            name="retrieval_groundedness",
+            instructions=(
+                "You are evaluating whether an AI response is grounded in the retrieved document context.\n\n"
+                "INPUTS (user query and retrieved context):\n{{ inputs }}\n\n"
+                "GENERATED RESPONSE:\n{{ outputs }}\n\n"
+                "Is the response grounded in the retrieved context? "
+                "Does it avoid introducing facts not present in the context? "
+                "Answer only 'yes' or 'no'."
+            ),
+            feedback_value_type=Literal["yes", "no"],
+            model="openai:/llama32",
+            base_url=llm_endpoint + "/v1/chat/completions",
+            extra_headers={"Authorization": "Bearer no-key-required"},
+        )
+
         SCORER_MAP = {
             "summary_quality": summary_quality_judge,
             "answer_quality": answer_quality_judge,
             "is_shorter": is_shorter,
+            "retrieval_relevance": retrieval_relevance_scorer,
+            "retrieval_groundedness": retrieval_groundedness_scorer,
         }
 
-        active_scorers = [SCORER_MAP[n] for n in scorer_names if n in SCORER_MAP]
+        RAG_SCORER_NAMES = {"retrieval_relevance", "retrieval_groundedness"}
+        text_scorers = [SCORER_MAP[n] for n in scorer_names if n in SCORER_MAP and n not in RAG_SCORER_NAMES]
+        rag_scorers = [SCORER_MAP[n] for n in scorer_names if n in SCORER_MAP and n in RAG_SCORER_NAMES]
 
-        if not active_scorers:
+        if not text_scorers and not rag_scorers:
             print(f"Warning: no recognised scorers in {config_path}, skipping.")
             continue
 
@@ -262,12 +299,11 @@ def run_all_mlflow_tests(
             if not inputs.get("prompt") and not inputs.get("messages"):
                 continue
             print(f"Calling {endpoint} with test inputs...")
-            generated = call_backend(inputs, endpoint)
-            eval_data.append({
-                "inputs":       inputs,
-                "outputs":      generated,
-                "expectations": expectations,
-            })
+            generated, trace_id = call_backend(inputs, endpoint)
+            entry = {"inputs": inputs, "outputs": generated, "expectations": expectations}
+            if trace_id:
+                entry["trace_id"] = trace_id
+            eval_data.append(entry)
 
         # Call backend for external dataset records and append to eval_data
         for record in external_records:
@@ -276,12 +312,11 @@ def run_all_mlflow_tests(
             if not inputs.get("prompt") and not inputs.get("messages"):
                 continue
             print(f"Calling {endpoint} with external record inputs...")
-            generated = call_backend(inputs, endpoint)
-            eval_data.append({
-                "inputs":       inputs,
-                "outputs":      generated,
-                "expectations": expectations,
-            })
+            generated, trace_id = call_backend(inputs, endpoint)
+            entry = {"inputs": inputs, "outputs": generated, "expectations": expectations}
+            if trace_id:
+                entry["trace_id"] = trace_id
+            eval_data.append(entry)
 
         if not eval_data:
             print(f"No test cases in {config_path}, skipping.")
@@ -294,12 +329,73 @@ def run_all_mlflow_tests(
             mlflow.log_param("endpoint", endpoint)
             mlflow.log_param("git_hash", git_hash)
 
-            results = mlflow.genai.evaluate(
-                data=eval_data,
-                scorers=active_scorers,
-            )
+            # Text-based scorers (answer_quality, is_shorter, etc.) run on eval_data directly
+            if text_scorers:
+                text_results = mlflow.genai.evaluate(
+                    data=eval_data,
+                    scorers=text_scorers,
+                )
+                print(f"Text scorer metrics: {text_results.metrics}")
 
-        print(f"Metrics for {config_path}: {results.metrics}")
+            # RAG scorers fetch retrieved context from backend traces in the test/prod workspace.
+            if rag_scorers:
+                rag_eval_data = [e for e in eval_data if "trace_id" in e]
+                print(f"RAG scorers active, records with trace_id: {len(rag_eval_data)}/{len(eval_data)}")
+                if not rag_eval_data:
+                    print("WARNING: no trace_ids in eval_data — backend may not be emitting trace_id SSE events.")
+                else:
+                    original_ws = os.environ.get("MLFLOW_WORKSPACE")
+                    enriched = []
+                    for ws in external_workspaces:
+                        os.environ["MLFLOW_WORKSPACE"] = ws
+                        mlflow.set_tracking_uri("")
+                        mlflow.set_tracking_uri(mlflow_tracking_uri)
+                        try:
+                            test_trace = mlflow.get_trace(rag_eval_data[0]["trace_id"])
+                            if test_trace is None:
+                                print(f"  Workspace '{ws}': trace not found, skipping.")
+                                continue
+                            print(f"  Workspace '{ws}': traces found, extracting retrieved context...")
+                            for entry in rag_eval_data:
+                                try:
+                                    trace = mlflow.get_trace(entry["trace_id"])
+                                    context = ""
+                                    if trace:
+                                        for span in trace.data.spans:
+                                            if getattr(span, "span_type", None) == "RETRIEVER":
+                                                outputs = span.outputs or []
+                                                if isinstance(outputs, list):
+                                                    context = "\n\n".join(str(c) for c in outputs)
+                                                elif isinstance(outputs, dict):
+                                                    chunks = outputs.get("chunks", list(outputs.values()))
+                                                    context = "\n\n".join(str(c) for c in chunks)
+                                                break
+                                    record = dict(entry)
+                                    record["inputs"] = {**entry["inputs"], "retrieved_context": context}
+                                    enriched.append(record)
+                                except Exception as e:
+                                    print(f"  Failed to enrich record: {e}")
+                                    enriched.append(entry)
+                            break
+                        except Exception as e:
+                            print(f"  Workspace '{ws}': error — {e}")
+                            continue
+
+                    if original_ws is not None:
+                        os.environ["MLFLOW_WORKSPACE"] = original_ws
+                    else:
+                        os.environ.pop("MLFLOW_WORKSPACE", None)
+                    mlflow.set_tracking_uri("")
+                    mlflow.set_tracking_uri(mlflow_tracking_uri)
+
+                    if enriched:
+                        rag_results = mlflow.genai.evaluate(
+                            data=enriched,
+                            scorers=rag_scorers,
+                        )
+                        print(f"RAG scorer metrics: {rag_results.metrics}")
+                    else:
+                        print(f"Warning: no traces found in {external_workspaces} for RAG scoring.")
         print(f"Results logged to MLflow. Tracking URI: {mlflow_tracking_uri}")
 
 
