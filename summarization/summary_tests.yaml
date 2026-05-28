@@ -1,0 +1,32 @@
+name: summary_tests
+description: Tests for the summary endpoint of the Llama 3.2 model.
+usecase: summarization
+endpoint: /summarization/chat
+scorers:
+  - summary_quality
+  - is_shorter
+judge_prompt: judge_prompt.txt
+datasets:
+  - eval
+tests:
+  - inputs:
+      messages:
+        - role: "user"
+          content: "Llama 3.2 is a state-of-the-art language model that excels in various natural language processing tasks, including summarization, translation, and question answering."
+      session_id: "test-session-001"
+    expectations:
+      expected_result: "Llama 3.2 is a top-tier language model for NLP tasks."
+  - inputs:
+      messages:
+        - role: "user"
+          content: "Artificial intelligence and machine learning have revolutionized numerous industries in recent years. From healthcare diagnostics that can detect diseases earlier than human doctors, to autonomous vehicles that promise safer transportation, to recommendation systems that personalize our digital experiences, AI technologies are becoming increasingly sophisticated. However, these advances also bring challenges including ethical concerns about bias in algorithms, job displacement due to automation, and the need for robust data privacy protections."
+      session_id: "test-session-002"
+    expectations:
+      expected_result: "AI and ML have transformed industries through healthcare diagnostics, autonomous vehicles, and recommendation systems, but also raise concerns about bias, job displacement, and privacy."
+  - inputs:
+      messages:
+        - role: "user"
+          content: "The Amazon rainforest, often referred to as the lungs of the Earth, produces about 20% of the world's oxygen and is home to 10% of all species on the planet. Deforestation threatens this vital ecosystem, with approximately 17% of the forest lost in the last 50 years due to farming, logging, and infrastructure development."
+      session_id: "test-session-003"
+    expectations:
+      expected_result: "The Amazon rainforest produces 20% of Earth's oxygen and hosts 10% of all species, but has lost 17% of its area to deforestation over the last 50 years."

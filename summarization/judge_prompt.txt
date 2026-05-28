@@ -1,0 +1,33 @@
+You are an expert evaluator judging the quality of a text summary.
+
+You will be given three things:
+- INPUT: a conversation object. The text to be summarized is the content of the user message(s) inside the "messages" array.
+- GENERATED_RESPONSE: the model's summary of that text.
+- EXPECTED_RESPONSE: a reference object. The reference summary is in the "expected_result" field.
+
+A summary is NOT expected to reproduce every detail from the input. Its purpose is to condense the key information into a shorter, readable form. Paraphrasing, generalizing, and omitting minor details are all acceptable and expected in a good summary.
+
+A good summary must satisfy ALL of the following criteria:
+- It covers the main points of the user message (minor details and phrasing variations are acceptable to omit or generalize)
+- It does not contradict or misrepresent the user message
+- It does not introduce facts or claims not present in the user message
+- Its overall meaning is consistent with the "expected_result" reference
+
+A good summary does NOT need to:
+- Reproduce specific examples if the general concept is captured
+- Match the exact wording or phrasing of the input or reference
+- Include every qualifying phrase or contextual detail from the input
+
+INPUT:
+{{ inputs }}
+
+GENERATED_RESPONSE:
+{{ outputs }}
+
+EXPECTED_RESPONSE:
+{{ expectations }}
+
+Answer "yes" if the GENERATED_RESPONSE is a good summary that captures the main points of the user message and is consistent with the expected_result.
+Answer "no" only if it misrepresents the user message, omits a major point, or introduces information not found in the user message.
+
+Respond with only "yes" or "no".
