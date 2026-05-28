@@ -82,7 +82,7 @@ def scan_directory_op() -> NamedTuple("Output", [("configs", List[dict])]):
 
 @component(
     base_image="python:3.12",
-    packages_to_install=["mlflow>=3.4.0", "httpx", "kubernetes"]
+    packages_to_install=["git+https://github.com/red-hat-data-services/mlflow@rhoai-3.4-ea.1", "httpx", "kubernetes", "litellm"]
 )
 def run_all_mlflow_tests(
     configs: List[dict],
@@ -93,18 +93,45 @@ def run_all_mlflow_tests(
 ):
     """Call the backend, then evaluate responses with MLflow scorers."""
     import os
-    import json
-    import yaml
-    import mlflow
-    from typing import Literal
-    from mlflow.genai.judges import make_judge
-    from mlflow.genai.scorers import scorer
-    from urllib.parse import urljoin
 
-    # MLflow setup
+    # Set LLM env vars BEFORE importing mlflow/litellm so that litellm picks up
+    # the correct base URL when it initialises its OpenAI client on first use.
     os.environ["MLFLOW_TRACKING_AUTH"] = "kubernetes"
     os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"
     os.environ["OPENAI_API_KEY"] = "no-key-required"
+    os.environ["OPENAI_API_BASE"] = llm_endpoint + "/v1"
+    os.environ["OPENAI_BASE_URL"] = llm_endpoint + "/v1"
+    os.environ["LLM_BASE_URL"] = llm_endpoint + "/v1"
+    os.environ["LLM_API_KEY"] = "no-key-required"
+    os.environ["LLM_MODEL"] = "llama32"
+
+    import json
+    import yaml
+    import litellm
+    import mlflow
+    from typing import Literal
+    from mlflow.genai.judges import make_judge
+    from mlflow.genai.scorers import scorer, RetrievalGroundedness, RetrievalRelevance, ToolCallCorrectness, ToolCallEfficiency
+    from urllib.parse import urljoin
+
+    # Monkey-patch litellm module-level attributes so all LLM calls (including
+    # built-in MLflow scorers that use the LiteLLM adapter) route to the local
+    # vLLM endpoint rather than api.openai.com.
+    litellm.api_base = llm_endpoint + "/v1"
+    litellm.api_key = "no-key-required"
+
+    # Monkey-patch _parse_chunk so that RETRIEVER spans returning plain strings
+    # (instead of dicts with a "page_content" key) are handled correctly by the
+    # RetrievalRelevance scorer.
+    from mlflow.genai.utils import trace_utils as _trace_utils
+    _orig_parse_chunk = _trace_utils._parse_chunk
+
+    def _patched_parse_chunk(chunk):
+        if isinstance(chunk, str):
+            return {"content": chunk}
+        return _orig_parse_chunk(chunk)
+
+    _trace_utils._parse_chunk = _patched_parse_chunk
 
     namespace_path = "/run/secrets/kubernetes.io/serviceaccount/namespace"
     if os.path.exists(namespace_path):
@@ -161,6 +188,18 @@ def run_all_mlflow_tests(
         elif "messages" in inputs:
             return send_request(inputs, url)
         return "", None, []
+
+    def get_trace_with_retry(trace_id, retries=6, delay=3.0):
+        """Fetch a trace, retrying to handle async trace ingestion lag."""
+        import time
+        for i in range(retries):
+            trace = mlflow.get_trace(trace_id)
+            if trace:
+                return trace
+            if i < retries - 1:
+                print(f"  Trace {trace_id} not yet available, retrying in {delay}s ({i+1}/{retries-1})...")
+                time.sleep(delay)
+        return None
 
     def fetch_workspace_records(workspace, dataset_names):
         """Fetch records from named datasets in a given MLflow workspace."""
@@ -230,20 +269,11 @@ def run_all_mlflow_tests(
                 "Respond with only \"yes\" or \"no\"."
             )
 
-        @scorer
-        def tool_choice(inputs: dict, expectations: dict) -> bool:
-            """Did the agent call all expected tools?"""
-            actual = set(inputs.get("tool_calls", []))
-            expected = set(expectations.get("expected_tools", []))
-            return expected.issubset(actual)
-
         summary_quality_judge = make_judge(
             name="summary_quality",
             instructions=judge_instructions,
             feedback_value_type=Literal["yes", "no"],
             model="openai:/llama32",
-            base_url=llm_endpoint + "/v1/chat/completions",
-            extra_headers={"Authorization": "Bearer no-key-required"},
         )
 
         answer_quality_judge = make_judge(
@@ -251,54 +281,28 @@ def run_all_mlflow_tests(
             instructions=judge_instructions,
             feedback_value_type=Literal["yes", "no"],
             model="openai:/llama32",
-            base_url=llm_endpoint + "/v1/chat/completions",
-            extra_headers={"Authorization": "Bearer no-key-required"},
         )
 
-        retrieval_relevance_scorer = make_judge(
-            name="retrieval_relevance",
-            instructions=(
-                "You are evaluating whether retrieved document context is relevant to a user query.\n\n"
-                "INPUTS (user query and retrieved context):\n{{ inputs }}\n\n"
-                "Is the retrieved context relevant to answering the user query? "
-                "Answer only 'yes' or 'no'."
-            ),
-            feedback_value_type=Literal["yes", "no"],
-            model="openai:/llama32",
-            base_url=llm_endpoint + "/v1/chat/completions",
-            extra_headers={"Authorization": "Bearer no-key-required"},
-        )
-
-        retrieval_groundedness_scorer = make_judge(
-            name="retrieval_groundedness",
-            instructions=(
-                "You are evaluating whether an AI response is grounded in the retrieved document context.\n\n"
-                "INPUTS (user query and retrieved context):\n{{ inputs }}\n\n"
-                "GENERATED RESPONSE:\n{{ outputs }}\n\n"
-                "Is the response grounded in the retrieved context? "
-                "Does it avoid introducing facts not present in the context? "
-                "Answer only 'yes' or 'no'."
-            ),
-            feedback_value_type=Literal["yes", "no"],
-            model="openai:/llama32",
-            base_url=llm_endpoint + "/v1/chat/completions",
-            extra_headers={"Authorization": "Bearer no-key-required"},
-        )
+        retrieval_groundedness_scorer = RetrievalGroundedness(model="openai:/llama32")
+        retrieval_relevance_scorer = RetrievalRelevance(model="openai:/llama32")
+        tool_call_correctness_scorer = ToolCallCorrectness(model="openai:/llama32", should_exact_match=True)
+        tool_call_efficiency_scorer = ToolCallEfficiency(model="openai:/llama32")
 
         SCORER_MAP = {
             "summary_quality": summary_quality_judge,
             "answer_quality": answer_quality_judge,
             "is_shorter": is_shorter,
-            "tool_choice": tool_choice,
-            "retrieval_relevance": retrieval_relevance_scorer,
-            "retrieval_groundedness": retrieval_groundedness_scorer,
+            "tool_call_correctness": tool_call_correctness_scorer,
+            "tool_call_efficiency": tool_call_efficiency_scorer,
         }
 
         RAG_SCORER_NAMES = {"retrieval_relevance", "retrieval_groundedness"}
-        text_scorers = [SCORER_MAP[n] for n in scorer_names if n in SCORER_MAP and n not in RAG_SCORER_NAMES]
-        rag_scorers = [SCORER_MAP[n] for n in scorer_names if n in SCORER_MAP and n in RAG_SCORER_NAMES]
+        TOOL_TRACE_SCORER_NAMES = {"tool_call_correctness", "tool_call_efficiency"}
+        text_scorers = [SCORER_MAP[n] for n in scorer_names if n in SCORER_MAP and n not in RAG_SCORER_NAMES and n not in TOOL_TRACE_SCORER_NAMES]
+        rag_scorer_names = [n for n in scorer_names if n in RAG_SCORER_NAMES]
+        tool_trace_scorer_names = [n for n in scorer_names if n in TOOL_TRACE_SCORER_NAMES]
 
-        if not text_scorers and not rag_scorers:
+        if not text_scorers and not rag_scorer_names and not tool_trace_scorer_names:
             print(f"Warning: no recognised scorers in {config_path}, skipping.")
             continue
 
@@ -346,57 +350,38 @@ def run_all_mlflow_tests(
             mlflow.log_param("endpoint", endpoint)
             mlflow.log_param("git_hash", git_hash)
 
-            # Text-based scorers (answer_quality, is_shorter, etc.) run on eval_data directly
-            if text_scorers:
-                text_results = mlflow.genai.evaluate(
-                    data=eval_data,
-                    scorers=text_scorers,
-                )
-                print(f"Text scorer metrics: {text_results.metrics}")
+            all_scorers = list(text_scorers)
 
-            # RAG scorers fetch retrieved context from backend traces in the test/prod workspace.
-            if rag_scorers:
-                rag_eval_data = [e for e in eval_data if "trace_id" in e]
-                print(f"RAG scorers active, records with trace_id: {len(rag_eval_data)}/{len(eval_data)}")
-                if not rag_eval_data:
+            # Fetch traces from external workspace once for both RAG and tool_call_correctness scorers.
+            # Using a prompt->trace map avoids injecting internal keys into inputs (which would
+            # pollute judge prompts) while still letting wrapper scorers look up the right trace.
+            prompt_to_trace = {}
+            if rag_scorer_names or tool_trace_scorer_names:
+                trace_entries = [e for e in eval_data if "trace_id" in e]
+                print(f"Fetching traces: {len(trace_entries)}/{len(eval_data)} entries have trace_id")
+                if not trace_entries:
                     print("WARNING: no trace_ids in eval_data — backend may not be emitting trace_id SSE events.")
                 else:
                     original_ws = os.environ.get("MLFLOW_WORKSPACE")
-                    enriched = []
+                    trace_id_to_trace = {}
                     for ws in external_workspaces:
                         os.environ["MLFLOW_WORKSPACE"] = ws
                         mlflow.set_tracking_uri("")
                         mlflow.set_tracking_uri(mlflow_tracking_uri)
                         try:
-                            test_trace = mlflow.get_trace(rag_eval_data[0]["trace_id"])
+                            test_trace = get_trace_with_retry(trace_entries[0]["trace_id"])
                             if test_trace is None:
-                                print(f"  Workspace '{ws}': trace not found, skipping.")
+                                print(f"  Workspace '{ws}': first trace not found after retries, trying next.")
                                 continue
-                            print(f"  Workspace '{ws}': traces found, extracting retrieved context...")
-                            for entry in rag_eval_data:
-                                try:
-                                    trace = mlflow.get_trace(entry["trace_id"])
-                                    context = ""
-                                    if trace:
-                                        for span in trace.data.spans:
-                                            if getattr(span, "span_type", None) == "RETRIEVER":
-                                                outputs = span.outputs or []
-                                                if isinstance(outputs, list):
-                                                    context = "\n\n".join(str(c) for c in outputs)
-                                                elif isinstance(outputs, dict):
-                                                    chunks = outputs.get("chunks", list(outputs.values()))
-                                                    context = "\n\n".join(str(c) for c in chunks)
-                                                break
-                                    record = dict(entry)
-                                    record["inputs"] = {**entry["inputs"], "retrieved_context": context}
-                                    enriched.append(record)
-                                except Exception as e:
-                                    print(f"  Failed to enrich record: {e}")
-                                    enriched.append(entry)
+                            print(f"  Workspace '{ws}': fetching {len(trace_entries)} trace(s)...")
+                            for entry in trace_entries:
+                                trace = get_trace_with_retry(entry["trace_id"])
+                                if trace:
+                                    trace_id_to_trace[entry["trace_id"]] = trace
+                            print(f"  Fetched {len(trace_id_to_trace)} trace(s)")
                             break
                         except Exception as e:
                             print(f"  Workspace '{ws}': error — {e}")
-                            continue
 
                     if original_ws is not None:
                         os.environ["MLFLOW_WORKSPACE"] = original_ws
@@ -405,14 +390,89 @@ def run_all_mlflow_tests(
                     mlflow.set_tracking_uri("")
                     mlflow.set_tracking_uri(mlflow_tracking_uri)
 
-                    if enriched:
-                        rag_results = mlflow.genai.evaluate(
-                            data=enriched,
-                            scorers=rag_scorers,
-                        )
-                        print(f"RAG scorer metrics: {rag_results.metrics}")
-                    else:
-                        print(f"Warning: no traces found in {external_workspaces} for RAG scoring.")
+                    for entry in eval_data:
+                        tid = entry.get("trace_id")
+                        if tid and tid in trace_id_to_trace:
+                            key = entry["inputs"].get("prompt") or str(entry["inputs"].get("messages", ""))
+                            trace = trace_id_to_trace[tid]
+                            prompt_to_trace[key] = trace
+                            span_types = [getattr(s, "span_type", None) for s in (trace.data.spans or [])]
+                            retriever_spans = [s for s in (trace.data.spans or []) if getattr(s, "span_type", None) == "RETRIEVER"]
+                            print(f"  Trace {tid}: span_types={span_types}, retriever_spans={len(retriever_spans)}")
+                            for rs in retriever_spans:
+                                outputs = rs.outputs or []
+                                n_chunks = len(outputs) if isinstance(outputs, list) else len(outputs.get("chunks", outputs))
+                                print(f"    RETRIEVER span '{rs.name}': {n_chunks} chunk(s)")
+
+            # RAG scorers — pass the pre-fetched trace directly to the built-in scorer
+            if rag_scorer_names:
+                if prompt_to_trace:
+                    if "retrieval_groundedness" in rag_scorer_names:
+                        @scorer
+                        def retrieval_groundedness(inputs: dict):
+                            key = inputs.get("prompt") or str(inputs.get("messages", ""))
+                            trace = prompt_to_trace.get(key)
+                            if not trace:
+                                print(f"  retrieval_groundedness: no trace for key={key!r:.80}")
+                                return None
+                            result = retrieval_groundedness_scorer(trace=trace)
+                            print(f"  retrieval_groundedness result: {result}")
+                            return result
+                        all_scorers.append(retrieval_groundedness)
+
+                    if "retrieval_relevance" in rag_scorer_names:
+                        @scorer
+                        def retrieval_relevance(inputs: dict):
+                            key = inputs.get("prompt") or str(inputs.get("messages", ""))
+                            trace = prompt_to_trace.get(key)
+                            if not trace:
+                                print(f"  retrieval_relevance: no trace for key={key!r:.80}")
+                                return None
+                            result = retrieval_relevance_scorer(trace=trace)
+                            print(f"  retrieval_relevance result: {result}")
+                            return result
+                        all_scorers.append(retrieval_relevance)
+                else:
+                    print(f"Warning: no traces found in {external_workspaces} for RAG scoring.")
+
+            # Tool call correctness/efficiency wrappers — look up pre-fetched trace by prompt
+            if tool_trace_scorer_names:
+                if prompt_to_trace:
+                    if "tool_call_correctness" in tool_trace_scorer_names:
+                        @scorer
+                        def tool_call_correctness(inputs: dict, expectations: dict):
+                            key = inputs.get("prompt") or str(inputs.get("messages", ""))
+                            trace = prompt_to_trace.get(key)
+                            if not trace:
+                                return None
+                            expected = [{"name": n} for n in expectations.get("expected_tools", [])]
+                            feedback = tool_call_correctness_scorer(
+                                trace=trace,
+                                expectations={"expected_tool_calls": expected},
+                            )
+                            return feedback.value if feedback else None
+                        all_scorers.append(tool_call_correctness)
+
+                    if "tool_call_efficiency" in tool_trace_scorer_names:
+                        @scorer
+                        def tool_call_efficiency(inputs: dict):
+                            key = inputs.get("prompt") or str(inputs.get("messages", ""))
+                            trace = prompt_to_trace.get(key)
+                            if not trace:
+                                return None
+                            feedback = tool_call_efficiency_scorer(trace=trace)
+                            return feedback.value if feedback else None
+                        all_scorers.append(tool_call_efficiency)
+                else:
+                    print(f"Warning: no traces found in {external_workspaces} for tool trace scoring.")
+
+            if all_scorers:
+                results = mlflow.genai.evaluate(
+                    data=eval_data,
+                    scorers=all_scorers,
+                )
+                print(f"Eval metrics: {results.metrics}")
+
         print(f"Results logged to MLflow. Tracking URI: {mlflow_tracking_uri}")
 
 
