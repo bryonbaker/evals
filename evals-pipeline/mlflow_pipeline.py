@@ -15,6 +15,10 @@ from kfp import dsl
 from kfp.dsl import component
 from kfp import kubernetes
 
+# 🚨 replace with your own user details and repo URL
+USER_NAME="Your user name"
+PASSWORD="Your password"
+GIT_SERVER="Your Gitea repository base url"
 
 @component(base_image='python:3.9')
 def git_clone_op(
@@ -523,7 +527,7 @@ def canopy_eval_pipeline(
 
 if __name__ == "__main__":
     arguments = {
-        "repo_url":             "https://<USER_NAME>:<PASSWORD>@<GIT_SERVER>/<USER_NAME>/evals.git",  # 🚨 replace with your own repo URL
+        "repo_url":             f"https://{USER_NAME}:{PASSWORD}@{GIT_SERVER}/{USER_NAME}/evals.git",
         "branch":               "main",
         "backend_url":          "http://canopy-backend:8000",
         "llm_endpoint":         "http://llama-32-predictor.ai501.svc.cluster.local:8080",
